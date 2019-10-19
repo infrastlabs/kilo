@@ -44,6 +44,8 @@ const (
 	PrivateKeyPath = KiloPath + "/key"
 	// ConfPath is the filepath where the WireGuard configuration is stored.
 	ConfPath = KiloPath + "/conf"
+	// DefaultKiloInterface is the default iterface created and used by Kilo.
+	DefaultKiloInterface = "kilo0"
 	// DefaultKiloPort is the default UDP port Kilo uses.
 	DefaultKiloPort = 51820
 	// DefaultCNIPath is the default path to the CNI config file.
@@ -167,26 +169,27 @@ type PeerBackend interface {
 // Mesh is able to create Kilo network meshes.
 type Mesh struct {
 	Backend
-	cni         bool
-	cniPath     string
-	enc         encapsulation.Encapsulator
-	externalIP  *net.IPNet
-	granularity Granularity
-	hostname    string
-	internalIP  *net.IPNet
-	ipTables    *iptables.Controller
-	kiloIface   int
-	key         []byte
-	local       bool
-	port        uint32
-	priv        []byte
-	privIface   int
-	pub         []byte
-	pubIface    int
-	stop        chan struct{}
-	subnet      *net.IPNet
-	table       *route.Table
-	wireGuardIP *net.IPNet
+	cleanUpIface bool
+	cni          bool
+	cniPath      string
+	enc          encapsulation.Encapsulator
+	externalIP   *net.IPNet
+	granularity  Granularity
+	hostname     string
+	internalIP   *net.IPNet
+	ipTables     *iptables.Controller
+	kiloIface    int
+	key          []byte
+	local        bool
+	port         uint32
+	priv         []byte
+	privIface    int
+	pub          []byte
+	pubIface     int
+	stop         chan struct{}
+	subnet       *net.IPNet
+	table        *route.Table
+	wireGuardIP  *net.IPNet
 
 	// nodes and peers are mutable fields in the struct
 	// and needs to be guarded.
@@ -202,7 +205,7 @@ type Mesh struct {
 }
 
 // New returns a new Mesh instance.
-func New(backend Backend, enc encapsulation.Encapsulator, granularity Granularity, hostname string, port uint32, subnet *net.IPNet, local, cni bool, cniPath string, logger log.Logger) (*Mesh, error) {
+func New(backend Backend, enc encapsulation.Encapsulator, granularity Granularity, hostname string, port uint32, subnet *net.IPNet, local, cni bool, cniPath, iface string, cleanUpIface bool, logger log.Logger) (*Mesh, error) {
 	if err := os.MkdirAll(KiloPath, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create directory to store configuration: %v", err)
 	}
@@ -239,7 +242,7 @@ func New(backend Backend, enc encapsulation.Encapsulator, granularity Granularit
 		return nil, fmt.Errorf("failed to find interface for public IP: %v", err)
 	}
 	pubIface := ifaces[0].Index
-	kiloIface, err := wireguard.New("kilo")
+	kiloIface, _, err := wireguard.New(iface)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create WireGuard interface: %v", err)
 	}
@@ -255,27 +258,28 @@ func New(backend Backend, enc encapsulation.Encapsulator, granularity Granularit
 		return nil, fmt.Errorf("failed to IP tables controller: %v", err)
 	}
 	return &Mesh{
-		Backend:     backend,
-		cni:         cni,
-		cniPath:     cniPath,
-		enc:         enc,
-		externalIP:  publicIP,
-		granularity: granularity,
-		hostname:    hostname,
-		internalIP:  privateIP,
-		ipTables:    ipTables,
-		kiloIface:   kiloIface,
-		nodes:       make(map[string]*Node),
-		peers:       make(map[string]*Peer),
-		port:        port,
-		priv:        private,
-		privIface:   privIface,
-		pub:         public,
-		pubIface:    pubIface,
-		local:       local,
-		stop:        make(chan struct{}),
-		subnet:      subnet,
-		table:       route.NewTable(),
+		Backend:      backend,
+		cleanUpIface: cleanUpIface,
+		cni:          cni,
+		cniPath:      cniPath,
+		enc:          enc,
+		externalIP:   publicIP,
+		granularity:  granularity,
+		hostname:     hostname,
+		internalIP:   privateIP,
+		ipTables:     ipTables,
+		kiloIface:    kiloIface,
+		nodes:        make(map[string]*Node),
+		peers:        make(map[string]*Peer),
+		port:         port,
+		priv:         private,
+		privIface:    privIface,
+		pub:          public,
+		pubIface:     pubIface,
+		local:        local,
+		stop:         make(chan struct{}),
+		subnet:       subnet,
+		table:        route.NewTable(),
 		errorCounter: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "kilo_errors_total",
 			Help: "Number of errors that occurred while administering the mesh.",
@@ -713,9 +717,11 @@ func (m *Mesh) cleanUp() {
 		level.Error(m.logger).Log("error", fmt.Sprintf("failed to delete configuration file: %v", err))
 		m.errorCounter.WithLabelValues("cleanUp").Inc()
 	}
-	if err := iproute.RemoveInterface(m.kiloIface); err != nil {
-		level.Error(m.logger).Log("error", fmt.Sprintf("failed to remove WireGuard interface: %v", err))
-		m.errorCounter.WithLabelValues("cleanUp").Inc()
+	if m.cleanUpIface {
+		if err := iproute.RemoveInterface(m.kiloIface); err != nil {
+			level.Error(m.logger).Log("error", fmt.Sprintf("failed to remove WireGuard interface: %v", err))
+			m.errorCounter.WithLabelValues("cleanUp").Inc()
+		}
 	}
 	if err := m.Nodes().CleanUp(m.hostname); err != nil {
 		level.Error(m.logger).Log("error", fmt.Sprintf("failed to clean up node backend: %v", err))
